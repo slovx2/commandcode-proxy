@@ -59,6 +59,141 @@ function loadConfig() {
 
 const CFG = loadConfig();
 
+// ── 模型名解析（目录驱动 + 内置兜底，零配置）────────────
+// CC 只认目录里的精确模型 ID，且**大小写敏感**（实测：moonshotai/Kimi-K3 可用、
+// moonshotai/kimi-k3 报 401 Model/provider not recognized），而客户端惯用官方风格的
+// 裸名或不同大小写（deepseek-flash / kimi-k3 / KIMI-K3 …）。解析顺序：
+//
+//   1) 目录归一：用 /provider/v1/models 的实时目录把名字（含大小写）对齐成精确 ID；
+//   2) 内置别名表：目录里没有的名字（如 deepseek-flash 这类官方现行名）按表改写；
+//   3) 同族前缀补全：仍未命中且不含 "/" 时补 vendor 前缀（尽力而为，保客户端大小写）；
+//   4) 其余原样透传。
+//
+// 目录由 ensureModelCatalog() 每 5 分钟刷新一次（与 /v1/models 共用缓存）；拉不到时
+// 只用内置表 + 前缀规则，行为与加这层之前一致（不会更差）。
+const BUILTIN_MODEL_IDS = {
+  // DeepSeek：官方现行名 deepseek-flash 即 V4.1-Flash；deepseek-v4-flash 是旧名，保留自身目录条目。
+  'deepseek-flash': 'deepseek/deepseek-v4.1-flash',
+  'deepseek-v4.1-flash': 'deepseek/deepseek-v4.1-flash',
+  'deepseek-v4-flash': 'deepseek/deepseek-v4-flash',
+  'deepseek-v4-flash-fast': 'deepseek/deepseek-v4-flash-fast',
+  'deepseek-v4-pro': 'deepseek/deepseek-v4-pro',
+  // Kimi
+  'kimi-k2.6': 'moonshotai/Kimi-K2.6',
+  'kimi-k2.5': 'moonshotai/Kimi-K2.5',
+  // GLM
+  'glm-5.1': 'zai-org/GLM-5.1',
+  'glm-5': 'zai-org/GLM-5',
+  // MiniMax
+  'minimax-m3': 'MiniMaxAI/MiniMax-M3',
+  'minimax-m2.7': 'MiniMaxAI/MiniMax-M2.7',
+  'minimax-m2.5': 'MiniMaxAI/MiniMax-M2.5',
+  // Qwen
+  'qwen3.7-max': 'Qwen/Qwen3.7-Max',
+  // Grok
+  'grok-4.6': 'xai/grok-4.6',
+  // Gemini
+  'gemini-3.5-flash': 'google/gemini-3.5-flash',
+  // Xiaomi
+  'mimo-v2.5': 'xiaomi/mimo-v2.5',
+};
+
+// 同族兜底：裸名以左侧开头时补上右侧 vendor 前缀。
+// 不含 claude-*/gpt-* —— 它们在 CC 目录里本来就是裸名，补前缀反而错。
+const BUILTIN_VENDOR_PREFIXES = [
+  ['deepseek-', 'deepseek/'],
+  ['kimi-', 'moonshotai/'],
+  ['moonshot-', 'moonshotai/'],
+  ['glm-', 'zai-org/'],
+  ['minimax-', 'MiniMaxAI/'],
+  ['qwen', 'Qwen/'],
+  ['grok-', 'xai/'],
+  ['gemini-', 'google/'],
+  ['mimo-', 'xiaomi/'],
+  ['step-', 'stepfun/'],
+];
+
+// 目录索引：lower(完整 ID) → 精确 ID；lower(模型段) → [精确 ID]（模型段 = 首个 "/" 之后）。
+// 由 buildModelCatalogIndex 重建，用于把下游的大小写/写法归一成 CC 的精确 ID。
+let catalogIdsByLower = new Map();
+let catalogSegmentsByLower = new Map();
+
+function buildModelCatalogIndex(models) {
+  const byId = new Map();
+  const bySegment = new Map();
+  for (const entry of models || []) {
+    const rawId = typeof entry === 'string' ? entry : (entry && entry.id);
+    if (typeof rawId !== 'string') continue;
+    const canonical = rawId.trim();
+    if (!canonical) continue;
+    byId.set(canonical.toLowerCase(), canonical);
+    const slash = canonical.indexOf('/');
+    const segment = slash >= 0 ? canonical.slice(slash + 1) : canonical;
+    if (!segment) continue;
+    const key = segment.toLowerCase();
+    const list = bySegment.get(key);
+    if (!list) bySegment.set(key, [canonical]);
+    else if (!list.includes(canonical)) list.push(canonical);
+  }
+  catalogIdsByLower = byId;
+  catalogSegmentsByLower = bySegment;
+}
+
+// 用目录把名字对齐成精确 ID；无法确定时返回 null（交给后续兜底规则）。
+//   - 含 "/"：按整串小写查目录；
+//   - 不含 "/"：先查目录里的裸名（claude-*/gpt-* 这类），再按模型段查；
+//     多候选时优先精确大小写匹配，仍不确定就不改写（不猜）。
+function canonicalModelIdFromCatalog(name) {
+  const lower = name.toLowerCase();
+  if (name.includes('/')) return catalogIdsByLower.get(lower) || null;
+
+  const bare = catalogIdsByLower.get(lower);
+  if (bare) return bare;
+
+  const candidates = catalogSegmentsByLower.get(lower);
+  if (!candidates || candidates.length === 0) return null;
+  if (candidates.length === 1) return candidates[0];
+  return candidates.find((id) => id.slice(id.indexOf('/') + 1) === name) || null;
+}
+
+// 把客户端请求的模型名解析成 CC 目录 ID；无法识别时原样返回（含 undefined/空值）。
+function resolveModelId(model) {
+  if (typeof model !== 'string') return model;
+  const name = model.trim();
+  if (!name) return model;
+
+  // 1) 目录归一（大小写/写法对齐）
+  const canonical = canonicalModelIdFromCatalog(name);
+  if (canonical) return canonical;
+
+  // 2) 内置别名表（hasOwnProperty 守卫：避免 "constructor"/"__proto__" 命中原型链属性）
+  const key = name.toLowerCase();
+  const mapped = Object.prototype.hasOwnProperty.call(BUILTIN_MODEL_IDS, key) ? BUILTIN_MODEL_IDS[key] : '';
+  if (mapped) return mapped;
+
+  // 3) 同族前缀补全（仅裸名）
+  if (!name.includes('/')) {
+    for (const [prefix, vendor] of BUILTIN_VENDOR_PREFIXES) {
+      if (key.startsWith(prefix)) return vendor + name;
+    }
+  }
+  return model;
+}
+
+// 目录刷新节流：模型列表缓存 5 分钟；**失败也节流**，避免上游不可用时每个请求都重试。
+let catalogAttemptAt = 0;
+
+async function ensureModelCatalog(apiKey) {
+  if (!apiKey || !CFG.useProviderModels) return;
+  if (Date.now() - catalogAttemptAt < CFG.modelRefreshIntervalMs) return;
+  catalogAttemptAt = Date.now();
+  try {
+    await fetchModels(apiKey);
+  } catch (e) {
+    // fetchModels 内部已兜底（失败退回内置列表），这里只保证不打断请求
+  }
+}
+
 // ── 设备指纹（形态与哈希逐字对齐官方 CLI 1.53.1） ──────
 // CPU 型号与核心数对应表（仅 Windows x64）
 const FINGERPRINT_CPUS = [
@@ -459,6 +594,10 @@ const MODELS = [
   { id: 'google/gemini-3.1-flash-lite', name: 'Gemini 3.1 Flash Lite' },
 ];
 
+// 先用内置目录建索引：拿不到实时目录（无 key / provider 端点不可用）时，
+// 这些名字的大小写归一依然生效。
+buildModelCatalogIndex(MODELS);
+
 // ── 工具函数 ───────────────────────────────────────
 
 // CLI 的 slug 规则：对**完整工作目录**做 slugify（@sindresorhus/slugify），空则 "root"，无随机后缀；
@@ -626,7 +765,8 @@ function buildCcRequest(openaiReq) {
     mode: CFG.cliMode || 'agent',
     // threadId 需为合法 UUID，否则整键省略（CLI 的 toWireThreadId）—— 在 forwardToCC 拿到 sessionId 后补
     params: {
-      model: model || 'deepseek/deepseek-v4-flash',
+      // 只改发往上游的名字；响应回显用的是客户端请求名（由各 handler 持有）。
+      model: resolveModelId(model) || 'deepseek/deepseek-v4-flash',
       messages: ccMessages,
       max_tokens: Math.min(max_tokens || 64000, 200000),
       stream: true,  // CC API 总是 stream
@@ -1189,6 +1329,9 @@ async function handleChatCompletions(req, res) {
   const model = openaiReq.model || 'deepseek/deepseek-v4-flash';
   const completionId = `chatcmpl-${randomUUID().slice(0, 12)}`;
   const created = nowUnix();
+
+  // 刷新模型目录（5 分钟节流），用于把大小写/写法归一成 CC 的精确模型 ID
+  await ensureModelCatalog(apiKey);
 
   // 构建 CC 请求体
   const ccBody = buildCcRequest(openaiReq);
@@ -2097,6 +2240,9 @@ async function handleMessages(req, res) {
   const stream = anthropicReq.stream === true;
   const model = anthropicReq.model || 'claude-sonnet-4-6';
 
+  // 刷新模型目录（5 分钟节流），用于把大小写/写法归一成 CC 的精确模型 ID
+  await ensureModelCatalog(apiKey);
+
   // Convert Anthropic → OpenAI → CC
   const openaiReq = convertAnthropicToOpenAI(anthropicReq);
   const ccBody = buildCcRequest(openaiReq);
@@ -2457,6 +2603,8 @@ async function fetchModels(apiKey) {
           name: m.id,
         }));
         modelsLastFetch = now;
+        // 实时目录同时用于模型名的大小写归一（下游写 kimi-k3 也能落到 moonshotai/Kimi-K3）
+        buildModelCatalogIndex(dynamicModels);
         log('info', 'Fetched models from Provider API', { count: dynamicModels.length });
         return dynamicModels;
       }
@@ -3014,6 +3162,8 @@ async function handleResponses(req, res) {
     tool_choice: typeof respReq.tool_choice === 'string' ? respReq.tool_choice : 'auto',
     tools: respReq.tools || [],
   };
+  // 刷新模型目录（5 分钟节流），用于把大小写/写法归一成 CC 的精确模型 ID
+  await ensureModelCatalog(apiKey);
   const ccBody = buildCcRequest(chatReq);
   const promptCacheKey = chatReq.prompt_cache_key;
   chatReq = null;
@@ -3292,10 +3442,166 @@ async function handleModels(req, res) {
   });
 }
 
+// ── 额度 / 用量（只读）────────────────────────────────
+// CC 的 CLI 线路本身就提供额度端点（与 CLI 的 /usage 命令同源，鉴权用同一把 API key，
+// 实测 Go/Provider 套餐均可用）：
+//   GET /alpha/billing/credits    → credits（月度/购买/赠送）+ windowLimits（5h / weekly 滚动窗口，含重置时间）
+//   GET /alpha/usage/summary      → 计费周期内的用量汇总
+// 代理暴露两个只读端点：
+//   GET /v1/cc/credits            → 原样透传 CC 的 credits JSON（窗口明细给看板/运维用）
+//   GET /v1/user/balance          → 合成 DeepSeek 按量付费的余额形状，供 sub2api 这类网关的
+//                                   「余额探测」直接消费（其请求路径为 {base_url}/user/balance，
+//                                   base_url 指到本代理的 /v1 时正好命中）
+//   GET /v1/usage/windows         → 通用「额度窗口」规范（见下），携带总额度 + 5h/weekly 窗口，
+//                                   供网关做窗口展示与窗口打满时的自动停调
+// 两者都只用调用方带来的 key 去查，不在代理侧存任何凭据。
+//
+// /usage/windows 规范（与厂商无关，官方没有该端点就回 404）：
+//   200 {"object":"usage_windows","is_available":bool,
+//        "windows":[{"window":"5h"|"weekly","used":num,"limit":num,"used_percent":num,"reset_at":"RFC3339"}],
+//        "balance":{"currency":"USD","total":num}}
+//   404 → 上游不支持窗口查询
+const CREDITS_TIMEOUT_MS = 10000;
+
+async function fetchUpstreamCredits(apiKey) {
+  const response = await fetch(`${CFG.apiBase}/alpha/billing/credits`, {
+    headers: {
+      'Authorization': `Bearer ${apiKey}`,
+      'x-cli-environment': 'production',
+      'x-command-code-version': CC_VERSION,
+    },
+    signal: AbortSignal.timeout(CREDITS_TIMEOUT_MS),
+  });
+  const text = await response.text();
+  let json = null;
+  try { json = JSON.parse(text); } catch {}
+  return { response, json };
+}
+
+// 上游失败时统一回一个可判定的错误体；401/403 原样透传（下游据此判定凭据问题），
+// 其余上游异常按 502 处理，绝不返回“余额看起来正常”的假数据。
+// 上游 404/501 视为「不支持该查询」，回 404 —— 与 /usage/windows 规范一致，
+// 下游据此隐藏窗口而不是报错。
+function sendCreditsError(res, response) {
+  const upstream = response ? response.status : 0;
+  const unsupported = upstream === 404 || upstream === 501;
+  const status = unsupported ? 404 : (upstream === 401 || upstream === 403 ? upstream : 502);
+  sendJSON(res, status, {
+    error: {
+      message: response ? `Failed to fetch credits from upstream (HTTP ${response.status})` : 'Failed to fetch credits from upstream',
+      type: unsupported ? 'unsupported' : (status === 401 || status === 403 ? 'authentication_error' : 'upstream_error'),
+    },
+  });
+}
+
+function creditsTotal(item) {
+  const c = (item && item.credits) || {};
+  const sum = ['monthlyCredits', 'purchasedCredits', 'freeCredits']
+    .reduce((acc, key) => acc + (Number(c[key]) || 0), 0);
+  return Math.round(sum * 1e6) / 1e6; // 抹掉浮点尾数（9.976708672 → 9.976709）
+}
+
+function creditsExhausted(item) {
+  const c = (item && item.credits) || {};
+  const w = (item && item.windowLimits) || {};
+  return w.exceeded === true || w.fiveHour?.exceeded === true || w.weekly?.exceeded === true || c.belowThreshold === true;
+}
+
+// CC 的窗口字段 → 规范里的窗口条目；used_percent 供网关直接画进度条。
+function creditsWindows(item) {
+  const w = (item && item.windowLimits) || {};
+  const out = [];
+  for (const [window, entry] of [['5h', w.fiveHour], ['weekly', w.weekly]]) {
+    if (!entry || typeof entry !== 'object') continue;
+    const used = Number(entry.used);
+    const limit = Number(entry.cap);
+    if (!Number.isFinite(used) || !Number.isFinite(limit) || limit <= 0) continue;
+    out.push({
+      window,
+      used: Math.round(used * 1e6) / 1e6,
+      limit,
+      used_percent: Math.round((used / limit) * 10000) / 100,
+      ...(Number.isFinite(Number(entry.resetAt)) ? { reset_at: new Date(Number(entry.resetAt)).toISOString() } : {}),
+    });
+  }
+  return out;
+}
+
+async function handleCcCredits(req, res) {
+  const apiKey = getApiKey(req.headers);
+  if (!apiKey) {
+    sendJSON(res, 401, { error: { message: 'Missing API key. Send in Authorization: Bearer <key> or x-api-key header', type: 'authentication_error' } });
+    return;
+  }
+  try {
+    const { response, json } = await fetchUpstreamCredits(apiKey);
+    if (!response.ok || !json) {
+      log('warn', 'Credits fetch failed', { status: response.status });
+      sendCreditsError(res, response);
+      return;
+    }
+    sendJSON(res, 200, json);
+  } catch (e) {
+    log('warn', 'Credits fetch error', { error: e.message });
+    sendCreditsError(res, null);
+  }
+}
+
+async function handleUserBalance(req, res) {
+  const apiKey = getApiKey(req.headers);
+  if (!apiKey) {
+    sendJSON(res, 401, { error: { message: 'Missing API key. Send in Authorization: Bearer <key> or x-api-key header', type: 'authentication_error' } });
+    return;
+  }
+  try {
+    const { response, json } = await fetchUpstreamCredits(apiKey);
+    if (!response.ok || !json) {
+      log('warn', 'Balance probe upstream failed', { status: response.status });
+      sendCreditsError(res, response);
+      return;
+    }
+    // 与 DeepSeek 的 /user/balance 同形：is_available + balance_infos[{currency,total_balance}]。
+    // 窗口打满或低于阈值一律报 unavailable —— 下游据此把该账号停调，窗口重置后自动恢复。
+    sendJSON(res, 200, {
+      is_available: !creditsExhausted(json),
+      balance_infos: [{ currency: 'USD', total_balance: creditsTotal(json) }],
+    });
+  } catch (e) {
+    log('warn', 'Balance probe error', { error: e.message });
+    sendCreditsError(res, null);
+  }
+}
+
+async function handleUsageWindows(req, res) {
+  const apiKey = getApiKey(req.headers);
+  if (!apiKey) {
+    sendJSON(res, 401, { error: { message: 'Missing API key. Send in Authorization: Bearer <key> or x-api-key header', type: 'authentication_error' } });
+    return;
+  }
+  try {
+    const { response, json } = await fetchUpstreamCredits(apiKey);
+    if (!response.ok || !json) {
+      log('warn', 'Usage windows fetch failed', { status: response.status });
+      sendCreditsError(res, response);
+      return;
+    }
+    sendJSON(res, 200, {
+      object: 'usage_windows',
+      is_available: !creditsExhausted(json),
+      windows: creditsWindows(json),
+      balance: { currency: 'USD', total: creditsTotal(json) },
+    });
+  } catch (e) {
+    log('warn', 'Usage windows fetch error', { error: e.message });
+    sendCreditsError(res, null);
+  }
+}
+
 function handleHealth(req, res) {
   res.writeHead(200, { 'Content-Type': 'text/plain' });
   res.end('OK');
 }
+
 
 // ── 服务器 ──────────────────────────────────────────
 
@@ -3348,6 +3654,12 @@ const server = http.createServer(async (req, res) => {
       await handleResponses(req, res);
     } else if (url.pathname === '/v1/models' && req.method === 'GET') {
       await handleModels(req, res);
+    } else if ((url.pathname === '/v1/user/balance' || url.pathname === '/user/balance') && req.method === 'GET') {
+      await handleUserBalance(req, res);
+    } else if (url.pathname === '/v1/cc/credits' && req.method === 'GET') {
+      await handleCcCredits(req, res);
+    } else if ((url.pathname === '/v1/usage/windows' || url.pathname === '/usage/windows') && req.method === 'GET') {
+      await handleUsageWindows(req, res);
     } else if (url.pathname === '/health' || url.pathname === '/') {
       handleHealth(req, res);
     } else {
