@@ -422,6 +422,131 @@ function summarizeUpstreamError(text, limit = 500) {
   return flat.length > limit ? flat.slice(0, limit) + '…(' + (flat.length - limit) + ' more)' : flat;
 }
 
+// ── 零输出诊断 ─────────────────────────────────────
+// 上游回 200 却没有任何输出时，代理会回 429 "Empty response from upstream"，原先不留任何线索。
+// 这里只记录请求/响应的「形状」：事件类型计数、finishReason、usage 数值、各类内容块的个数与长度。
+// 绝不记录文本、图片、工具名/参数、凭据等任何内容。
+
+// 只保留 usage 里的数值字段（含 inputTokenDetails / outputTokenDetails 一层）
+function pickUsageNumbers(u) {
+  if (!u || typeof u !== 'object') return null;
+  const out = {};
+  for (const [k, v] of Object.entries(u)) {
+    if (typeof v === 'number') out[k] = v;
+    else if (v && typeof v === 'object' && !Array.isArray(v) && /Details$/.test(k)) {
+      const sub = {};
+      for (const [k2, v2] of Object.entries(v)) if (typeof v2 === 'number') sub[k2] = v2;
+      out[k] = sub;
+    }
+  }
+  return out;
+}
+
+// 上游 NDJSON 事件统计：每条解析出的事件调 observe，解析失败的行调 unparsed
+function createCcEventStats() {
+  const counts = {};
+  let lines = 0;
+  let unparsedLines = 0;
+  let finishReason = null;
+  let usage = null;
+  return {
+    observe(event) {
+      lines++;
+      const type = typeof event?.type === 'string' ? event.type.slice(0, 40) : '(no-type)';
+      counts[type] = (counts[type] || 0) + 1;
+      if (type === 'finish' || type === 'finish-step') {
+        if (event.finishReason != null) finishReason = String(event.finishReason).slice(0, 40);
+        const u = pickUsageNumbers(event.totalUsage || event.usage);
+        if (u) usage = u;
+      }
+    },
+    unparsed() { lines++; unparsedLines++; },
+    snapshot() { return { lines, unparsedLines, eventCounts: counts, finishReason, usage }; },
+  };
+}
+
+// 各类内容块的「字符量」：只取长度，不取内容
+function ccPartLength(part) {
+  if (typeof part === 'string') return part.length;
+  if (!part || typeof part !== 'object') return 0;
+  switch (part.type) {
+    case 'text': case 'reasoning': return String(part.text ?? '').length;
+    case 'image': return typeof part.image === 'string' ? part.image.length : 0;
+    case 'tool-call':
+      try { return typeof part.input === 'string' ? part.input.length : JSON.stringify(part.input ?? {}).length; } catch { return 0; }
+    case 'tool-result': {
+      const v = part.output?.value;
+      return typeof v === 'string' ? v.length : 0;
+    }
+    default: return 0;
+  }
+}
+
+// CC 请求体的形状摘要（buildCcRequest 的产物）
+function summarizeCcRequestShape(ccBody, incomingHeaders) {
+  const p = ccBody?.params || {};
+  const msgs = Array.isArray(p.messages) ? p.messages : [];
+  const roles = {};
+  const parts = {};
+  const partChars = {};
+  let cacheMarkers = 0;
+  for (const m of msgs) {
+    const role = typeof m?.role === 'string' ? m.role : '(none)';
+    roles[role] = (roles[role] || 0) + 1;
+    const content = Array.isArray(m?.content) ? m.content : [m?.content];
+    for (const c of content) {
+      const type = typeof c === 'string' ? 'string' : (typeof c?.type === 'string' ? c.type.slice(0, 40) : '(none)');
+      parts[type] = (parts[type] || 0) + 1;
+      partChars[type] = (partChars[type] || 0) + ccPartLength(c);
+      if (c?.cache_control) cacheMarkers++;
+    }
+  }
+  const last = msgs[msgs.length - 1];
+  const system = Array.isArray(p.system) ? p.system : [];
+  return {
+    upstreamModel: typeof p.model === 'string' ? p.model : null,
+    incomingBodyBytes: Number(incomingHeaders?.['content-length']) || null,
+    messages: msgs.length,
+    roles,
+    parts,
+    partChars,
+    cacheMarkers,
+    lastRole: last?.role ?? null,
+    lastParts: Array.isArray(last?.content) ? last.content.map(c => (typeof c?.type === 'string' ? c.type.slice(0, 40) : '(none)')) : [],
+    systemBlocks: system.length,
+    systemChars: system.reduce((n, b) => n + String(b?.text ?? '').length, 0),
+    tools: Array.isArray(p.tools) ? p.tools.length : 0,
+    toolChoice: p.tool_choice?.type ?? null,
+    maxTokens: p.max_tokens ?? null,
+    reasoningEffort: p.reasoning_effort ?? null,
+  };
+}
+
+// 上游响应头里与排查相关、且不含敏感信息的字段
+const DIAG_RESPONSE_HEADERS = ['content-type', 'x-request-id', 'cf-ray', 'x-vercel-id', 'retry-after'];
+
+function logEmptyUpstream({ path, stream, model, startTime, bytesReceived, stats, ccBody, ccResponse, incomingHeaders, extra }) {
+  const headers = {};
+  for (const h of DIAG_RESPONSE_HEADERS) {
+    const v = ccResponse?.headers?.get?.(h);
+    if (v) headers[h] = String(v).slice(0, 120);
+  }
+  let request;
+  try { request = summarizeCcRequestShape(ccBody, incomingHeaders); } catch (e) { request = { error: e.message }; }
+  log('warn', 'Empty upstream response (zero output)', {
+    path,
+    stream,
+    model,
+    elapsedMs: Date.now() - startTime,
+    upstreamStatus: ccResponse?.status ?? null,
+    upstreamHeaders: headers,
+    bytesReceived,
+    upstream: stats ? stats.snapshot() : null,
+    ...(extra || {}),
+    request,
+  });
+}
+
 // ── 会话管理 ───────────────────────────────────────
 // 每个 API Key 独立一个 session，12h 过期 + 1h 随机抖动
 // 同一 Key 在同一周期内复用，到期自动换新
@@ -856,13 +981,15 @@ function createSseTranslator(model, completionId, created) {
     inputTokens: 0,
     outputTokens: 0,
     cachedInputTokens: 0,
+    stats: createCcEventStats(),
     /** 解析一行 NDJSON，返回 OpenAI chunk 数组 */
     parseLine(line) {
       const trimmed = line.trim();
       if (!trimmed || trimmed === '[DONE]' || trimmed.startsWith(':')) return null;
 
       let event;
-      try { event = JSON.parse(trimmed); } catch { return null; }
+      try { event = JSON.parse(trimmed); } catch { this.stats.unparsed(); return null; }
+      this.stats.observe(event);
       if (!event.type) return null;
       this.lastCcEvent = event.type;
 
@@ -1480,6 +1607,11 @@ async function handleChatCompletions(req, res) {
             try { res.write(`data: ${JSON.stringify(err.body)}\n\n`); } catch {}
           // 输出 token 为 0 时记为错误，避免下游异常计费
           } else if (translator.outputTokens === 0) {
+            logEmptyUpstream({
+              path: '/v1/chat/completions', stream: true, model, startTime, bytesReceived,
+              stats: translator.stats, ccBody, ccResponse, incomingHeaders: req.headers,
+              extra: { lastCcEvent: lastCcEvent || '(none)', clientStarted: started },
+            });
             try { if (!abortController.signal.aborted) abortController.abort(); } catch {}
             if (!started) {
               sendJSON(res, 429, { error: { message: 'Empty response from upstream (zero output tokens)', type: 'rate_limit_error' }, retry_after: 10 });
@@ -1559,6 +1691,7 @@ async function handleChatCompletions(req, res) {
       let usage = null;
       let toolCalls = null;
       let upstreamError = null;
+      const stats = createCcEventStats();
 
       reader = ccResponse.body.getReader();
       const decoder = new TextDecoder();
@@ -1571,7 +1704,9 @@ async function handleChatCompletions(req, res) {
           const trimmed = line.trim();
           if (!trimmed || trimmed === '[DONE]' || trimmed.startsWith(':')) continue;
           try {
-            const event = JSON.parse(trimmed);
+            let event;
+            try { event = JSON.parse(trimmed); } catch { stats.unparsed(); continue; }
+            stats.observe(event);
             switch (event.type) {
               case 'text-delta': lastCcEvent = event.type; fullText += event.text || ''; break;
               case 'reasoning-delta': lastCcEvent = event.type; reasoningContent += event.text || ''; break;
@@ -1654,6 +1789,11 @@ async function handleChatCompletions(req, res) {
 
       // 输出 token 为 0 时记为错误，避免下游异常计费
       if ((usage?.outputTokens ?? 0) === 0) {
+        logEmptyUpstream({
+          path: '/v1/chat/completions', stream: false, model, startTime, bytesReceived,
+          stats, ccBody, ccResponse, incomingHeaders: req.headers,
+          extra: { lastCcEvent: lastCcEvent || '(none)', textChars: fullText.length, reasoningChars: reasoningContent.length, toolCalls: toolCalls ? toolCalls.length : 0 },
+        });
         try { if (!abortController.signal.aborted) abortController.abort(); } catch {}
         sendJSON(res, 429, { error: { message: 'Empty response from upstream (zero output tokens)', type: 'rate_limit_error' }, retry_after: 10 });
         return;
@@ -2066,7 +2206,8 @@ async function* createAnthropicSseTranslator(response, model, messageId, ctx) {
         const trimmed = line.trim();
         if (!trimmed || trimmed === '[DONE]') continue;
         let event;
-        try { event = JSON.parse(trimmed); } catch { continue; }
+        try { event = JSON.parse(trimmed); } catch { ctx.stats?.unparsed(); continue; }
+        ctx.stats?.observe(event);
         if (!event.type) continue;
         ctx.lastCcEvent = event.type;
 
@@ -2332,7 +2473,7 @@ async function handleMessages(req, res) {
       let ctx;
       try {
         messageId = 'msg_' + randomUUID().slice(0, 12);
-        ctx = { bytesReceived: 0, lastCcEvent: '', inputTokens: 0, outputTokens: 0, cachedInputTokens: 0, upstreamError: null };
+        ctx = { bytesReceived: 0, lastCcEvent: '', inputTokens: 0, outputTokens: 0, cachedInputTokens: 0, upstreamError: null, stats: createCcEventStats() };
         const generator = createAnthropicSseTranslator(ccResponse, model, messageId, ctx);
         for await (const event of generator) {
           if (aborted) break;
@@ -2361,6 +2502,11 @@ async function handleMessages(req, res) {
             }
             // started 时 error 事件已在循环中经 SSE 下发，按规范 error 事件即终结
           } else if (ctx.outputTokens === 0) {
+            logEmptyUpstream({
+              path: '/v1/messages', stream: true, model, startTime, bytesReceived: ctx.bytesReceived,
+              stats: ctx.stats, ccBody, ccResponse, incomingHeaders: req.headers,
+              extra: { lastCcEvent: ctx.lastCcEvent || '(none)', clientStarted: started },
+            });
             try { abortController.abort(); } catch {}
             if (!started) {
               sendAnthropicError(res, 429, 'rate_limit_error', 'Empty response from upstream (zero output tokens)', 10);
@@ -2432,6 +2578,7 @@ async function handleMessages(req, res) {
       let toolCalls = null;
       let thinkingText = ''; // CC reasoning → Anthropic thinking block
       let upstreamError = null;
+      const stats = createCcEventStats();
 
       reader = ccResponse.body.getReader();
       const decoder = new TextDecoder();
@@ -2444,7 +2591,9 @@ async function handleMessages(req, res) {
           const trimmed = line.trim();
           if (!trimmed || trimmed === '[DONE]') continue;
           try {
-            const event = JSON.parse(trimmed);
+            let event;
+            try { event = JSON.parse(trimmed); } catch { stats.unparsed(); continue; }
+            stats.observe(event);
             switch (event.type) {
               case 'text-delta': lastCcEvent = event.type; fullText += event.text || ''; break;
               case 'reasoning-delta': lastCcEvent = event.type; thinkingText += event.text || ''; break;
@@ -2529,6 +2678,11 @@ async function handleMessages(req, res) {
       // 零输出判定改为按实际内容：上游偶发不回 totalUsage 时，旧逻辑（usage?.outputTokens ?? 0 === 0）
       // 会把有完整文本的响应误杀成 429
       if (!fullText && !thinkingText && !toolCalls) {
+        logEmptyUpstream({
+          path: '/v1/messages', stream: false, model, startTime, bytesReceived,
+          stats, ccBody, ccResponse, incomingHeaders: req.headers,
+          extra: { lastCcEvent: lastCcEvent || '(none)' },
+        });
         try { if (!abortController.signal.aborted) abortController.abort(); } catch {}
         sendAnthropicError(res, 429, 'rate_limit_error', 'Empty response from upstream (zero output tokens)', 10);
         return;
@@ -2997,13 +3151,15 @@ function createResponsesSseTranslator(model, responseId, created) {
     inputTokens: 0,
     outputTokens: 0,
     cachedInputTokens: 0,
+    stats: createCcEventStats(),
     get started() { return createdSent; },
     get stopReason() { return finishReason; },
     parseLine(line) {
       const trimmed = line.trim();
       if (!trimmed || trimmed === '[DONE]' || trimmed.startsWith(':')) return null;
       let event;
-      try { event = JSON.parse(trimmed); } catch { return null; }
+      try { event = JSON.parse(trimmed); } catch { this.stats.unparsed(); return null; }
+      this.stats.observe(event);
       if (!event.type) return null;
       this.lastCcEvent = event.type;
       const out = [];
@@ -3256,6 +3412,11 @@ async function handleResponses(req, res) {
             const failed = translator.fail(translator.upstreamError.body.error.message);
             if (failed.length) await writeEvents(failed);
           } else if (translator.outputTokens === 0 && !translator.started) {
+            logEmptyUpstream({
+              path: '/v1/responses', stream: true, model, startTime, bytesReceived,
+              stats: translator.stats, ccBody, ccResponse, incomingHeaders: req.headers,
+              extra: { lastCcEvent: lastCcEvent || '(none)' },
+            });
             try { if (!abortController.signal.aborted) abortController.abort(); } catch (e2) {}
             sendResponsesError(res, 429, 'rate_limit_error',
               'Empty response from upstream (zero output tokens)', 10);
@@ -3308,6 +3469,7 @@ async function handleResponses(req, res) {
       let sawFinish = false;
       let upstreamError = null;
       const toolCalls = [];
+      const stats = createCcEventStats();
       reader = ccResponse.body.getReader();
       const decoder = new TextDecoder();
       let buf = '';
@@ -3319,7 +3481,8 @@ async function handleResponses(req, res) {
           const trimmed = line.trim();
           if (!trimmed || trimmed === '[DONE]' || trimmed.startsWith(':')) continue;
           let event;
-          try { event = JSON.parse(trimmed); } catch (e2) { continue; }
+          try { event = JSON.parse(trimmed); } catch (e2) { stats.unparsed(); continue; }
+          stats.observe(event);
           switch (event.type) {
             case 'text-delta': lastCcEvent = event.type; fullText += event.text || ''; break;
             case 'reasoning-delta': lastCcEvent = event.type; thinkingText += event.text || ''; break;
@@ -3404,6 +3567,11 @@ async function handleResponses(req, res) {
       }
 
       if (!fullText && !thinkingText && !toolCalls.length) {
+        logEmptyUpstream({
+          path: '/v1/responses', stream: false, model, startTime, bytesReceived,
+          stats, ccBody, ccResponse, incomingHeaders: req.headers,
+          extra: { lastCcEvent: lastCcEvent || '(none)' },
+        });
         try { if (!abortController.signal.aborted) abortController.abort(); } catch (e2) {}
         sendResponsesError(res, 429, 'rate_limit_error',
           'Empty response from upstream (zero output tokens)', 10);
