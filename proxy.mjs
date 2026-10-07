@@ -422,8 +422,9 @@ function summarizeUpstreamError(text, limit = 500) {
   return flat.length > limit ? flat.slice(0, limit) + '…(' + (flat.length - limit) + ' more)' : flat;
 }
 
-// ── 零输出诊断 ─────────────────────────────────────
-// 上游回 200 却没有任何输出时，代理会回 429 "Empty response from upstream"，原先不留任何线索。
+// ── 上游异常诊断 ───────────────────────────────────
+// 上游回 200 却没有任何输出（代理回 429 "Empty response from upstream"）、或没有正常走完 finish
+//（代理回 502）时，原先不留任何线索。
 // 这里只记录请求/响应的「形状」：事件类型计数、finishReason、usage 数值、各类内容块的个数与长度。
 // 绝不记录文本、图片、工具名/参数、凭据等任何内容。
 
@@ -525,7 +526,7 @@ function summarizeCcRequestShape(ccBody, incomingHeaders) {
 // 上游响应头里与排查相关、且不含敏感信息的字段
 const DIAG_RESPONSE_HEADERS = ['content-type', 'x-request-id', 'cf-ray', 'x-vercel-id', 'retry-after'];
 
-function logEmptyUpstream({ path, stream, model, startTime, bytesReceived, stats, ccBody, ccResponse, incomingHeaders, extra }) {
+function logUpstreamDiag({ message = 'Empty upstream response (zero output)', path, stream, model, startTime, bytesReceived, stats, ccBody, ccResponse, incomingHeaders, extra }) {
   const headers = {};
   for (const h of DIAG_RESPONSE_HEADERS) {
     const v = ccResponse?.headers?.get?.(h);
@@ -533,7 +534,7 @@ function logEmptyUpstream({ path, stream, model, startTime, bytesReceived, stats
   }
   let request;
   try { request = summarizeCcRequestShape(ccBody, incomingHeaders); } catch (e) { request = { error: e.message }; }
-  log('warn', 'Empty upstream response (zero output)', {
+  log('warn', message, {
     path,
     stream,
     model,
@@ -1600,14 +1601,18 @@ async function handleChatCompletions(req, res) {
           // 零输出只是它的表象（此时按 429 报会掩盖真实原因）。
           } else if (translator.incompleteDetail()) {
             const detail = translator.incompleteDetail();
-            log('warn', 'Upstream stream incomplete', { path: '/v1/chat/completions', reason: detail });
+            logUpstreamDiag({
+              message: 'Upstream stream incomplete', path: '/v1/chat/completions', stream: true, model, startTime, bytesReceived,
+              stats: translator.stats, ccBody, ccResponse, incomingHeaders: req.headers,
+              extra: { reason: detail, lastCcEvent: lastCcEvent || '(none)', clientStarted: started },
+            });
             const err = incompleteUpstreamError(detail);
             try { if (!abortController.signal.aborted) abortController.abort(); } catch {}
             if (!started) { sendJSON(res, err.status, err.body); return; }
             try { res.write(`data: ${JSON.stringify(err.body)}\n\n`); } catch {}
           // 输出 token 为 0 时记为错误，避免下游异常计费
           } else if (translator.outputTokens === 0) {
-            logEmptyUpstream({
+            logUpstreamDiag({
               path: '/v1/chat/completions', stream: true, model, startTime, bytesReceived,
               stats: translator.stats, ccBody, ccResponse, incomingHeaders: req.headers,
               extra: { lastCcEvent: lastCcEvent || '(none)', clientStarted: started },
@@ -1780,7 +1785,11 @@ async function handleChatCompletions(req, res) {
       // 上游没有正常走完 finish —— 对齐 CLI 按可重试 502 处理，不谎报成功
       const incomplete = incompleteUpstreamDetail(sawFinish, finishReason);
       if (incomplete) {
-        log('warn', 'Upstream stream incomplete', { path: '/v1/chat/completions', reason: incomplete });
+        logUpstreamDiag({
+          message: 'Upstream stream incomplete', path: '/v1/chat/completions', stream: false, model, startTime, bytesReceived,
+          stats, ccBody, ccResponse, incomingHeaders: req.headers,
+          extra: { reason: incomplete, lastCcEvent: lastCcEvent || '(none)' },
+        });
         const err = incompleteUpstreamError(incomplete);
         try { if (!abortController.signal.aborted) abortController.abort(); } catch {}
         sendJSON(res, err.status, err.body);
@@ -1789,7 +1798,7 @@ async function handleChatCompletions(req, res) {
 
       // 输出 token 为 0 时记为错误，避免下游异常计费
       if ((usage?.outputTokens ?? 0) === 0) {
-        logEmptyUpstream({
+        logUpstreamDiag({
           path: '/v1/chat/completions', stream: false, model, startTime, bytesReceived,
           stats, ccBody, ccResponse, incomingHeaders: req.headers,
           extra: { lastCcEvent: lastCcEvent || '(none)', textChars: fullText.length, reasoningChars: reasoningContent.length, toolCalls: toolCalls ? toolCalls.length : 0 },
@@ -2318,7 +2327,7 @@ async function* createAnthropicSseTranslator(response, model, messageId, ctx) {
       // 对齐 CLI：这一族一律按可重试错误处理。
       const incomplete = incompleteUpstreamDetail(sawFinish, finishNorm);
       if (incomplete) {
-        log('warn', 'Upstream stream incomplete', { path: '/v1/messages', reason: incomplete });
+        ctx.incomplete = incomplete;
         yield `event: error\ndata: ${JSON.stringify({ type: 'error', error: incompleteUpstreamError(incomplete).body.error })}\n\n`;
       // 输出 token 为 0 时记为错误，避免下游异常计费
       } else if (outputTokens === 0) {
@@ -2477,7 +2486,9 @@ async function handleMessages(req, res) {
         const generator = createAnthropicSseTranslator(ccResponse, model, messageId, ctx);
         for await (const event of generator) {
           if (aborted) break;
-          if (!started && !event.startsWith('event: message_start')) {
+          // error 事件不触发 flush：尚未写出任何内容时，收尾按 HTTP 状态码回错（429/502 可被下游重试），
+          // 与 chat / responses 端点一致；原先会先回 200 再在流里发 error。
+          if (!started && !event.startsWith('event: message_start') && !event.startsWith('event: error')) {
             await flushBuf();
           }
           if (started) {
@@ -2501,8 +2512,22 @@ async function handleMessages(req, res) {
               );
             }
             // started 时 error 事件已在循环中经 SSE 下发，按规范 error 事件即终结
+          } else if (ctx.incomplete) {
+            // 对齐 chat 端点：上游没有正常走完 finish → 可重试的 502，排在零输出判定之前
+            logUpstreamDiag({
+              message: 'Upstream stream incomplete', path: '/v1/messages', stream: true, model, startTime, bytesReceived: ctx.bytesReceived,
+              stats: ctx.stats, ccBody, ccResponse, incomingHeaders: req.headers,
+              extra: { reason: ctx.incomplete, lastCcEvent: ctx.lastCcEvent || '(none)', clientStarted: started },
+            });
+            try { abortController.abort(); } catch {}
+            if (!started) {
+              const err = incompleteUpstreamError(ctx.incomplete);
+              sendAnthropicError(res, err.status, err.body.error.type, err.body.error.message, err.retry_after);
+              return;
+            }
+            // started 时 error 事件已在循环中经 SSE 下发
           } else if (ctx.outputTokens === 0) {
-            logEmptyUpstream({
+            logUpstreamDiag({
               path: '/v1/messages', stream: true, model, startTime, bytesReceived: ctx.bytesReceived,
               stats: ctx.stats, ccBody, ccResponse, incomingHeaders: req.headers,
               extra: { lastCcEvent: ctx.lastCcEvent || '(none)', clientStarted: started },
@@ -2667,7 +2692,11 @@ async function handleMessages(req, res) {
       {
         const incomplete = incompleteUpstreamDetail(sawFinish, finishReason);
         if (incomplete) {
-          log('warn', 'Upstream stream incomplete', { path: '/v1/messages', reason: incomplete });
+          logUpstreamDiag({
+            message: 'Upstream stream incomplete', path: '/v1/messages', stream: false, model, startTime, bytesReceived,
+            stats, ccBody, ccResponse, incomingHeaders: req.headers,
+            extra: { reason: incomplete, lastCcEvent: lastCcEvent || '(none)' },
+          });
           const err = incompleteUpstreamError(incomplete);
           try { if (!abortController.signal.aborted) abortController.abort(); } catch {}
           sendAnthropicError(res, err.status, err.body.error.type, err.body.error.message, err.retry_after);
@@ -2678,7 +2707,7 @@ async function handleMessages(req, res) {
       // 零输出判定改为按实际内容：上游偶发不回 totalUsage 时，旧逻辑（usage?.outputTokens ?? 0 === 0）
       // 会把有完整文本的响应误杀成 429
       if (!fullText && !thinkingText && !toolCalls) {
-        logEmptyUpstream({
+        logUpstreamDiag({
           path: '/v1/messages', stream: false, model, startTime, bytesReceived,
           stats, ccBody, ccResponse, incomingHeaders: req.headers,
           extra: { lastCcEvent: lastCcEvent || '(none)' },
@@ -3154,6 +3183,10 @@ function createResponsesSseTranslator(model, responseId, created) {
     stats: createCcEventStats(),
     get started() { return createdSent; },
     get stopReason() { return finishReason; },
+    /** 这次上游流若没有正常走完 finish，返回可读原因；正常则为 null。 */
+    incompleteDetail() {
+      return incompleteUpstreamDetail(sawFinish, finishReason);
+    },
     parseLine(line) {
       const trimmed = line.trim();
       if (!trimmed || trimmed === '[DONE]' || trimmed.startsWith(':')) return null;
@@ -3411,8 +3444,22 @@ async function handleResponses(req, res) {
             }
             const failed = translator.fail(translator.upstreamError.body.error.message);
             if (failed.length) await writeEvents(failed);
+          // 对齐 chat 端点：上游没有正常走完 finish 时，「no finish event」才是根因，零输出只是表象，
+          // 必须排在零输出判定之前，回可重试的 502 —— 原先这里会被误报成 429 "zero output tokens"。
+          // 已开始写出时交给下面的 translator.finish()，它会发 response.failed。
+          } else if (translator.incompleteDetail() && !translator.started) {
+            const detail = translator.incompleteDetail();
+            logUpstreamDiag({
+              message: 'Upstream stream incomplete', path: '/v1/responses', stream: true, model, startTime, bytesReceived,
+              stats: translator.stats, ccBody, ccResponse, incomingHeaders: req.headers,
+              extra: { reason: detail, lastCcEvent: lastCcEvent || '(none)' },
+            });
+            const err = incompleteUpstreamError(detail);
+            try { if (!abortController.signal.aborted) abortController.abort(); } catch (e2) {}
+            sendResponsesError(res, err.status, err.body.error.type, err.body.error.message, err.retry_after);
+            return;
           } else if (translator.outputTokens === 0 && !translator.started) {
-            logEmptyUpstream({
+            logUpstreamDiag({
               path: '/v1/responses', stream: true, model, startTime, bytesReceived,
               stats: translator.stats, ccBody, ccResponse, incomingHeaders: req.headers,
               extra: { lastCcEvent: lastCcEvent || '(none)' },
@@ -3558,7 +3605,11 @@ async function handleResponses(req, res) {
       {
         const incomplete = incompleteUpstreamDetail(sawFinish, finishReason);
         if (incomplete) {
-          log('warn', 'Upstream stream incomplete', { path: '/v1/responses', reason: incomplete });
+          logUpstreamDiag({
+            message: 'Upstream stream incomplete', path: '/v1/responses', stream: false, model, startTime, bytesReceived,
+            stats, ccBody, ccResponse, incomingHeaders: req.headers,
+            extra: { reason: incomplete, lastCcEvent: lastCcEvent || '(none)' },
+          });
           const err = incompleteUpstreamError(incomplete);
           try { if (!abortController.signal.aborted) abortController.abort(); } catch {}
           sendResponsesError(res, err.status, err.body.error.type, err.body.error.message, err.retry_after);
@@ -3567,7 +3618,7 @@ async function handleResponses(req, res) {
       }
 
       if (!fullText && !thinkingText && !toolCalls.length) {
-        logEmptyUpstream({
+        logUpstreamDiag({
           path: '/v1/responses', stream: false, model, startTime, bytesReceived,
           stats, ccBody, ccResponse, incomingHeaders: req.headers,
           extra: { lastCcEvent: lastCcEvent || '(none)' },
