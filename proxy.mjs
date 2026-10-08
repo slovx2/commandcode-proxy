@@ -32,6 +32,7 @@ function loadConfig() {
     deviceProjectDir: '', // 伪造的项目目录（留空则用内置的 C:\Users\dev\projects\app） // 改这个值 = 让所有账号换一台设备（见设备指纹注释）
     emptySystemPlaceholder: true, // 无 system prompt 时发空格占位，阻止 CC 上游注入 ~7.5K token 默认提示词（issue #17）
     upstreamProxy: '',            // 上游 HTTP 代理，如 http://127.0.0.1:7890（issue #18）
+    upstreamProxyByVendor: {},    // 按模型供应商分流的上游代理，如 { anthropic: 'http://egress:3128' }；'direct' = 强制直连
   };
 
   const configPath = resolve(__dirname, 'config.json');
@@ -58,6 +59,16 @@ function loadConfig() {
   if (process.env.CC_CLI_SESSION_MODE) defaults.cliSessionMode = process.env.CC_CLI_SESSION_MODE;
   if (process.env.CC_EMPTY_SYSTEM_PLACEHOLDER) defaults.emptySystemPlaceholder = process.env.CC_EMPTY_SYSTEM_PLACEHOLDER !== 'false';
   if (process.env.CC_UPSTREAM_PROXY) defaults.upstreamProxy = process.env.CC_UPSTREAM_PROXY;
+  // 形如 anthropic=http://egress:3128,openai=http://egress:3128；与 config.json 的同名对象合并，环境变量优先
+  if (process.env.CC_UPSTREAM_PROXY_BY_VENDOR) {
+    const byVendor = { ...defaults.upstreamProxyByVendor };
+    for (const pair of process.env.CC_UPSTREAM_PROXY_BY_VENDOR.split(',')) {
+      const i = pair.indexOf('=');
+      if (i <= 0) continue;
+      byVendor[pair.slice(0, i).trim().toLowerCase()] = pair.slice(i + 1).trim();
+    }
+    defaults.upstreamProxyByVendor = byVendor;
+  }
 
   return defaults;
 }
@@ -1468,18 +1479,51 @@ function parseProxyUrl(raw) {
   return { host: u.hostname, port: Number.parseInt(u.port || '80', 10), auth };
 }
 
+// 按模型供应商分流（fork 扩展）：只作用于生成请求（/alpha/generate）。CC 网关跑在 Cloudflare 上，
+// 在离调用方最近的机房执行并由那里出站访问模型供应商 —— 从香港出口调 Claude 会被 Anthropic
+// 的地区限制拒绝（流内 403 Forbidden），同一个 key 从美国出口则正常。
+// 预请求（指纹 / lifecycle）、模型目录、额度查询不带模型，一律走默认路由（upstreamProxy 或直连）。
+// 值为 'direct' 时该供应商强制直连（即使配了全局 upstreamProxy）。
+const UPSTREAM_PROXY_BY_VENDOR = Object.fromEntries(
+  Object.entries(CFG.upstreamProxyByVendor || {})
+    .map(([vendor, url]) => [vendor.trim().toLowerCase(), String(url || '').trim()])
+    .filter(([vendor, url]) => vendor && url),
+);
+
+/** CC 模型 ID → 供应商：claude-* / gpt-* 等裸名按族归类，带斜杠的取斜杠前的厂商名（小写）。 */
+function modelVendor(model) {
+  const id = String(model || '').toLowerCase();
+  if (!id) return '';
+  if (id.startsWith('claude-')) return 'anthropic';
+  if (/^(gpt-|chatgpt-|codex|o\d)/.test(id) || id.startsWith('openai/')) return 'openai';
+  const slash = id.indexOf('/');
+  return slash > 0 ? id.slice(0, slash) : '';
+}
+
+/** 该模型的生成请求应走的代理；'' = 直连。 */
+function upstreamProxyForModel(model) {
+  const route = UPSTREAM_PROXY_BY_VENDOR[modelVendor(model)];
+  if (route === undefined) return UPSTREAM_PROXY;
+  return route === 'direct' ? '' : route;
+}
+
 // 启动即校验：写错的代理地址应当立刻拒绝启动，而不是每个请求各 502 一次。
-if (UPSTREAM_PROXY) {
+for (const [name, url] of [['default', UPSTREAM_PROXY], ...Object.entries(UPSTREAM_PROXY_BY_VENDOR)]) {
+  if (!url || url === 'direct') continue;
   try {
-    parseProxyUrl(UPSTREAM_PROXY);
+    parseProxyUrl(url);
   } catch (e) {
     log('error', 'Invalid upstreamProxy, refusing to start', {
-      error: e.message, value: redactProxyUrl(UPSTREAM_PROXY),
+      route: name, error: e.message, value: redactProxyUrl(url),
     });
     process.exit(1);
   }
-  log('info', 'Upstream requests will go through the configured proxy', {
-    proxy: redactProxyUrl(UPSTREAM_PROXY),
+}
+if (UPSTREAM_PROXY || Object.keys(UPSTREAM_PROXY_BY_VENDOR).length) {
+  log('info', 'Upstream proxy routes', {
+    default: redactProxyUrl(UPSTREAM_PROXY),
+    byVendor: Object.fromEntries(Object.entries(UPSTREAM_PROXY_BY_VENDOR)
+      .map(([vendor, url]) => [vendor, url === 'direct' ? '(direct)' : redactProxyUrl(url)])),
   });
 }
 
@@ -1494,8 +1538,8 @@ function headersToInit(raw) {
 }
 
 /** 经 HTTP 代理发上游请求，返回与 fetch 兼容的 Response（.ok/.status/.text()/.body）。 */
-async function proxyFetch(urlStr, options = {}) {
-  const proxy = parseProxyUrl(UPSTREAM_PROXY);
+async function proxyFetch(urlStr, options = {}, proxyUrl) {
+  const proxy = parseProxyUrl(proxyUrl);
   const u = new URL(urlStr);
   const isTls = u.protocol === 'https:';
   const port = Number.parseInt(u.port || (isTls ? '443' : '80'), 10);
@@ -1566,9 +1610,9 @@ async function proxyFetch(urlStr, options = {}) {
   });
 }
 
-/** 上游请求入口：配了代理走隧道，否则用原生 fetch（默认路径行为完全不变）。 */
-function upstreamFetch(urlStr, options) {
-  return UPSTREAM_PROXY ? proxyFetch(urlStr, options) : fetch(urlStr, options);
+/** 上游请求入口：配了代理走隧道，否则用原生 fetch。proxyUrl 默认取全局路由，生成请求按模型传入。 */
+function upstreamFetch(urlStr, options, proxyUrl = UPSTREAM_PROXY) {
+  return proxyUrl ? proxyFetch(urlStr, options, proxyUrl) : fetch(urlStr, options);
 }
 
 // ── 流式转发 ────────────────────────────────────────
@@ -1609,7 +1653,7 @@ async function forwardToCC(body, apiKey, incomingHeaders = {}, signal, promptCac
     headers,
     body: JSON.stringify(body),
     signal,
-  });
+  }, upstreamProxyForModel(body.params?.model));
 
   return response;
 }
@@ -4105,7 +4149,7 @@ async function handleModels(req, res) {
 const CREDITS_TIMEOUT_MS = 10000;
 
 async function fetchUpstreamCredits(apiKey) {
-  const response = await fetch(`${CFG.apiBase}/alpha/billing/credits`, {
+  const response = await upstreamFetch(`${CFG.apiBase}/alpha/billing/credits`, {
     headers: {
       'Authorization': `Bearer ${apiKey}`,
       'x-cli-environment': 'production',

@@ -75,6 +75,8 @@ commandcode/
 | `HOST` | `0.0.0.0` | Listen address → `host` |
 | `CC_API_BASE` | `https://api.commandcode.ai` | Upstream base URL → `apiBase` |
 | `CC_UPSTREAM_PROXY` | *(unset)* | Route requests **to the CC upstream** through an HTTP proxy (`http://` CONNECT only); see "Upstream proxy" below → `upstreamProxy` |
+| `CC_UPSTREAM_PROXY_BY_VENDOR` | *(unset)* | Per-vendor proxy for generation requests, e.g. `anthropic=http://egress:3128,openai=direct`; see "Per-vendor routing" below → `upstreamProxyByVendor` |
+| `CC_RESPONSES_EARLY_START` | `false` | `/v1/responses` streaming emits `response.created` (plus keep-alives) as soon as upstream returns 200; when on, failures before the first token arrive as in-stream `response.failed` |
 | `PROJECT_SLUG` | `cc-proxy` | `x-project-slug` → `projectSlug` |
 | `LOG_FILE` | empty | Log file → `logFile` (**synchronous writes**, see [Other notes](#other-notes)) |
 | `CC_USE_PROVIDER_MODELS` | `true` | Fetch the model list dynamically → `useProviderModels` |
@@ -146,6 +148,23 @@ CC_UPSTREAM_PROXY=http://127.0.0.1:7890 npm start
 - Credentials in the proxy URL (`http://user:pass@host:port`) are never logged: only `host:port` shows up.
 
 > Node's built-in `fetch` does **not** read `HTTPS_PROXY`/`HTTP_PROXY`. The official env-var route requires Node ≥ 22.21 / 24.5 plus `NODE_USE_ENV_PROXY=1`; this option works without either.
+
+#### Per-vendor routing (`upstreamProxyByVendor` / `CC_UPSTREAM_PROXY_BY_VENDOR`)
+
+Send only some vendors' models through a proxy — e.g. Claude is refused from a Hong Kong egress (the CC gateway egresses from the Cloudflare colo nearest the caller, and Hong Kong is not an Anthropic-supported region; it shows up as an in-stream `403 Forbidden`) while every other model stays direct:
+
+```json
+{ "upstreamProxyByVendor": { "anthropic": "http://egress:3128", "openai": "http://egress:3128" } }
+```
+
+```bash
+CC_UPSTREAM_PROXY_BY_VENDOR=anthropic=http://egress:3128,openai=http://egress:3128 npm start
+```
+
+- Applies to generation requests (`/alpha/generate`) only, classified by the **resolved CC model ID**: `claude-*` → `anthropic`; `gpt-*` / `o<digit>*` / `codex*` / `chatgpt-*` / `openai/*` → `openai`; IDs with a slash use the lowercase prefix before it (`google`, `xai`, `deepseek`, …).
+- Vendors without an entry use the global `upstreamProxy` (direct if unset); the value `direct` forces a vendor direct even when a global proxy is set.
+- Fingerprint/lifecycle pre-requests, the model catalog and credit lookups carry no model and always use the global route — so with per-vendor routing one account shows up from two egresses, the trade-off the previous section warns about.
+- The env var is merged over the same-named `config.json` object (env wins); vendor names are case-insensitive. Any invalid URL refuses to start.
 
 ## API Endpoints
 

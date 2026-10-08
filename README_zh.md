@@ -75,6 +75,8 @@ commandcode/
 | `HOST` | `0.0.0.0` | 监听地址 → `host` |
 | `CC_API_BASE` | `https://api.commandcode.ai` | 上游地址 → `apiBase` |
 | `CC_UPSTREAM_PROXY` | 空 | 让**发往 CC 上游**的请求走 HTTP 代理（仅 `http://` CONNECT），见下文「上游代理」→ `upstreamProxy` |
+| `CC_UPSTREAM_PROXY_BY_VENDOR` | 空 | 按模型供应商分流生成请求的代理，如 `anthropic=http://egress:3128,openai=direct`，见下文「按模型供应商分流」→ `upstreamProxyByVendor` |
+| `CC_RESPONSES_EARLY_START` | `false` | `/v1/responses` 流式拿到上游 200 即下发 `response.created` 并保活；开启后首字前失败改走流内 `response.failed` |
 | `PROJECT_SLUG` | `cc-proxy` | `x-project-slug` → `projectSlug` |
 | `LOG_FILE` | 空 | 日志文件 → `logFile`（**同步写**，见[其它注意事项](#其它注意事项)）|
 | `CC_USE_PROVIDER_MODELS` | `true` | 动态拉取模型列表 → `useProviderModels` |
@@ -141,6 +143,23 @@ CC_UPSTREAM_PROXY=http://127.0.0.1:7890 npm start
 - 代理地址里带账号密码（`http://user:pass@host:port`）时，日志只保留 `host:port`，**不打印口令**。
 
 > Node 原生 `fetch` **不读** `HTTPS_PROXY`/`HTTP_PROXY`。官方环境变量路线需要 Node ≥ 22.21 / 24.5 且设 `NODE_USE_ENV_PROXY=1`；本选项两者都不需要。
+
+#### 按模型供应商分流（`upstreamProxyByVendor` / `CC_UPSTREAM_PROXY_BY_VENDOR`）
+
+只让部分供应商的模型走代理，例如 Claude 从香港出口会被拒（CC 网关在离调用方最近的 Cloudflare 机房出站，香港不在 Anthropic 支持地区，表现为流内 `403 Forbidden`），而其余模型照常直连：
+
+```json
+{ "upstreamProxyByVendor": { "anthropic": "http://egress:3128", "openai": "http://egress:3128" } }
+```
+
+```bash
+CC_UPSTREAM_PROXY_BY_VENDOR=anthropic=http://egress:3128,openai=http://egress:3128 npm start
+```
+
+- 只作用于生成请求（`/alpha/generate`），按**解析后的 CC 模型 ID** 归类：`claude-*` → `anthropic`；`gpt-*` / `o<数字>*` / `codex*` / `chatgpt-*` / `openai/*` → `openai`；带斜杠的 ID 取斜杠前的厂商名（小写，如 `google`、`xai`、`deepseek`）。
+- 未命中的供应商走全局 `upstreamProxy`（未配则直连）；值写 `direct` 可让某供应商在配了全局代理时仍直连。
+- 指纹/lifecycle 预请求、模型目录、额度查询不带模型，一律走全局路由 —— 因此分流后同一账号会从两个出口出现，与上一节「预请求也走代理」的初衷相悖，按需取舍。
+- 环境变量与 `config.json` 的同名对象合并，环境变量优先；供应商名大小写不敏感。任一地址非法即拒绝启动。
 
 ## API 接口
 

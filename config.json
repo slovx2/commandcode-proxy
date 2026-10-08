@@ -7,5 +7,6 @@
   "logFile": "",
   "logLevel": "info",
   "zdr": false,
-  "upstreamProxy": ""
+  "upstreamProxy": "",
+  "upstreamProxyByVendor": {}
 }
