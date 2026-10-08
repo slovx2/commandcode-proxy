@@ -2871,6 +2871,30 @@ function splitToolOutputImageParts(output) {
   return { text: JSON.stringify(output === undefined ? '' : output), images: [] };
 }
 
+/**
+ * 兜底：删掉找不到发起方的 tool 消息（原地修改）。Chat 上游要求 tool 消息紧跟
+ * 带同名 tool_calls 的 assistant 回合，孤立的一条就会让整轮 400，且历史每轮重放、
+ * 会话从此卡死。正常转换不会产生孤立项；出现即说明上游历史有本代理没覆盖的形态，
+ * 记 warn 便于定位。system 消息会被 buildCcRequest 提到最前，不打断配对。
+ */
+function dropOrphanToolMessages(messages) {
+  let open = new Set();
+  const dropped = [];
+  let w = 0;
+  for (const msg of messages) {
+    if (msg.role === 'assistant') {
+      open = new Set((msg.tool_calls || []).map(tc => tc.id));
+    } else if (msg.role === 'tool') {
+      if (!open.has(msg.tool_call_id)) { dropped.push(msg.tool_call_id); continue; }
+    } else if (msg.role !== 'system') {
+      open = new Set();
+    }
+    messages[w++] = msg;
+  }
+  messages.length = w;
+  if (dropped.length) log('warn', 'Dropped orphan tool messages', { count: dropped.length, callIds: dropped.slice(0, 5) });
+}
+
 function convertResponsesToChat(respReq) {
   const messages = [];
 
@@ -2921,7 +2945,7 @@ function convertResponsesToChat(respReq) {
       // HTTP 200 下静默丢消息。这里只在 type 缺失时兜底，带 type 的 item 判定不变。
       const kind = item.type ?? (item.role ? 'message' : undefined);
       // 攒着的工具图在这里落一条 user 消息，保证它排在下一个非工具结果项之前
-      if (kind !== 'function_call_output') flushToolImages();
+      if (kind !== 'function_call_output' && kind !== 'custom_tool_call_output') flushToolImages();
       switch (kind) {
         case 'reasoning': {
           const t = responsesReasoningOf(item);
@@ -2957,7 +2981,19 @@ function convertResponsesToChat(respReq) {
           });
           break;
         }
-        case 'function_call_output': {
+        // custom（freeform）工具的入参是原始文本，Chat 只有 JSON arguments 槽，
+        // 按 {"input": 原文} 包一层（与 sub2api 降级 custom 工具的口径一致）。
+        // 不能丢：丢了调用而保留输出，会留下孤立的 tool 消息被上游 400。
+        case 'custom_tool_call': {
+          ensurePending().tool_calls.push({
+            id: item.call_id || item.id || ('call_' + randomUUID().slice(0, 8)),
+            type: 'function',
+            function: { name: item.name || '', arguments: JSON.stringify({ input: typeof item.input === 'string' ? item.input : '' }) },
+          });
+          break;
+        }
+        case 'function_call_output':
+        case 'custom_tool_call_output': {
           flushPending();
           const { text: toolText, images } = splitToolOutputImageParts(item.output);
           messages.push({
@@ -2980,6 +3016,7 @@ function convertResponsesToChat(respReq) {
   }
   flushPending();
   flushToolImages();
+  dropOrphanToolMessages(messages);
 
   let tools;
   if (Array.isArray(respReq.tools) && respReq.tools.length) {
