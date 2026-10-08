@@ -85,7 +85,7 @@ commandcode/
 | `CC_CLI_SESSION_MODE` | `interactive` | Lifecycle metadata `mode` → `cliSessionMode` |
 | `CC_FINGERPRINT_SALT` | empty | Fingerprint salt → `fingerprintSalt` |
 | `CC_DEVICE_PROJECT_DIR` | empty | Faked project directory → `deviceProjectDir` |
-| `CC_EMPTY_SYSTEM_PLACEHOLDER` | `true` | Space placeholder for a missing system prompt; `false` disables → `emptySystemPlaceholder` |
+| `CC_EMPTY_SYSTEM_PLACEHOLDER` | `true` | Space placeholder for a missing system prompt (`.` for Claude models — Anthropic rejects whitespace-only system text); `false` disables → `emptySystemPlaceholder` |
 | `CC_MAX_BODY_MB` | `100` | Max request body size in MB; oversized requests get `413` |
 | `CC_MAX_TOOL_IMAGE_MB` | `6` | Total per-request budget for tool screenshots (base64); older ones become a placeholder; `0` disables. See [Tool screenshot budget](#tool-screenshot-budget) |
 | `CC_STREAM_IDLE_MS` | `30000` | Streaming upstream read idle timeout; see [Upstream idle timeouts](#upstream-idle-timeouts) |

@@ -959,7 +959,10 @@ function buildCcRequest(openaiReq) {
     // 真机验证 prompt_tokens 从 7653 降到 85。
     // 默认开启；config.json 设 "emptySystemPlaceholder": false 或环境变量
     // CC_EMPTY_SYSTEM_PLACEHOLDER=false 可关闭（回到原生的缺省行为）。
-    body.params.system = [{ type: 'text', text: ' ' }];
+    // Claude 例外：Anthropic 拒收纯空白的 system（400 "text content blocks must contain
+    // non-whitespace text"），改用最小的非空白占位 '.'。
+    const placeholder = modelVendor(body.params.model) === 'anthropic' ? '.' : ' ';
+    body.params.system = [{ type: 'text', text: placeholder }];
   }
   if (temperature !== undefined) {
     body.params.temperature = temperature;

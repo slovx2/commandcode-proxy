@@ -85,7 +85,7 @@ commandcode/
 | `CC_CLI_SESSION_MODE` | `interactive` | lifecycle 元数据的 `mode` → `cliSessionMode` |
 | `CC_FINGERPRINT_SALT` | 空 | 设备指纹盐 → `fingerprintSalt` |
 | `CC_DEVICE_PROJECT_DIR` | 空 | 伪装的项目目录 → `deviceProjectDir` |
-| `CC_EMPTY_SYSTEM_PLACEHOLDER` | `true` | 无 system prompt 时发空格占位；`false` 关掉 → `emptySystemPlaceholder` |
+| `CC_EMPTY_SYSTEM_PLACEHOLDER` | `true` | 无 system prompt 时发空格占位（Claude 模型发 `.`：Anthropic 拒收纯空白 system）；`false` 关掉 → `emptySystemPlaceholder` |
 | `CC_MAX_BODY_MB` | `100` | 请求体上限（MB），超限返回 `413` |
 | `CC_MAX_TOOL_IMAGE_MB` | `6` | 单请求内工具截图（base64）总预算，超预算的老图换成占位；`0` 关闭，见[工具截图预算](#工具截图预算) |
 | `CC_STREAM_IDLE_MS` | `30000` | 流式上游读空闲超时，见[上游空闲超时](#上游空闲超时) |
