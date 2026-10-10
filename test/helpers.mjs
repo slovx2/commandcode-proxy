@@ -3,7 +3,7 @@
 import http from 'node:http';
 import { spawn } from 'node:child_process';
 import { setTimeout as sleep } from 'node:timers/promises';
-import { mkdtempSync, copyFileSync, existsSync, rmSync } from 'node:fs';
+import { mkdtempSync, copyFileSync, existsSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -100,6 +100,10 @@ export async function startProxy({ upstreamPort, env = {}, cwd } = {}) {
   const ownWorkdir = cwd === undefined;
   const workdir = cwd ?? mkdtempSync(join(tmpdir(), 'ccp-test-'));
   copyFileSync(join(REPO, 'proxy.mjs'), join(workdir, 'proxy.mjs'));
+  // 代理在临时目录里运行，依赖（jimp）通过软链指回仓库的 node_modules。
+  if (existsSync(join(REPO, 'node_modules')) && !existsSync(join(workdir, 'node_modules'))) {
+    symlinkSync(join(REPO, 'node_modules'), join(workdir, 'node_modules'), 'dir');
+  }
   if (!existsSync(join(workdir, 'config.json'))) {
     copyFileSync(join(REPO, 'config.json'), join(workdir, 'config.json'));
   }

@@ -1620,6 +1620,141 @@ function upstreamFetch(urlStr, options, proxyUrl = UPSTREAM_PROXY) {
 
 // ── 流式转发 ────────────────────────────────────────
 
+// ── 带图请求：图片压缩 + 改走 fast 部署（fork 扩展）──────────────
+// 背景（真机实测 2026-10-10）：
+//   deepseek/deepseek-v4.1-flash 只要上下文里有图片，首 token 就从 2–4s 涨到 10–60s，且随图片
+//   累积继续恶化；deepseek/deepseek-v4.1-flash-fast 同样的请求只要 3–4s。
+// 两步处理，都只作用于发往上游的请求体：
+//   1) 压缩：对齐官方 CLI read_file 的做法（jimp；长边缩到 1200；JPEG q95，带透明通道的 PNG 保持
+//      PNG；base64 仍超 5e6 时依次降到 q80/60/40/20）。
+//   2) 分流：请求里带图片时，把模型改成配置的 fast 部署。图片会留在会话历史里，所以按「是否带图」
+//      分流天然有粘性：一个会话只在第一张图进入时切一次。两个部署的提示缓存不共用，切换那一次
+//      按全价输入计费，之后每轮照常命中缓存。
+// 任何一步失败都原样放行，不让请求失败。
+const IMAGE_COMPACT_VENDORS = new Set(
+  String(process.env.CC_IMAGE_COMPACT_VENDORS ?? 'deepseek').split(',').map(v => v.trim().toLowerCase()).filter(Boolean),
+);
+const IMAGE_MODEL_ROUTES = new Map(
+  String(process.env.CC_IMAGE_MODEL_ROUTES ?? 'deepseek/deepseek-v4.1-flash=deepseek/deepseek-v4.1-flash-fast')
+    .split(',').map(pair => pair.split('=').map(s => s.trim())).filter(([from, to]) => from && to),
+);
+const IMAGE_MAX_EDGE = 1200;
+const IMAGE_JPEG_QUALITY = 95;
+const IMAGE_FALLBACK_QUALITIES = [80, 60, 40, 20];
+const IMAGE_MAX_BASE64 = 5e6;
+// 超过这个长度的图片不解码（纯 JS 解码会长时间占住事件循环），原样放行
+const IMAGE_MAX_DECODE_BASE64 = 16 * 1024 * 1024;
+// 同一张图会随会话每一轮重发：按内容哈希缓存压缩结果，既不重复压缩，也保证每轮字节一致（不破坏上游前缀缓存）
+const IMAGE_CACHE_MAX_BYTES = 32 * 1024 * 1024;
+const imageCache = new Map();   // sha256(data URL) → { image, mimeType }
+let imageCacheBytes = 0;
+let jimpModule;
+let jimpUnavailableLogged = false;
+
+function loadJimp() {
+  jimpModule ??= import('jimp').catch((e) => {
+    if (!jimpUnavailableLogged) {
+      jimpUnavailableLogged = true;
+      log('warn', 'jimp unavailable, images are forwarded uncompressed', { error: e.message });
+    }
+    return null;
+  });
+  return jimpModule;
+}
+
+function rememberImage(key, value) {
+  imageCache.set(key, value);
+  imageCacheBytes += value.image.length;
+  for (const [oldKey, old] of imageCache) {
+    if (imageCacheBytes <= IMAGE_CACHE_MAX_BYTES) break;
+    imageCache.delete(oldKey);
+    imageCacheBytes -= old.image.length;
+  }
+}
+
+/** 压缩一张 data URL 图片；返回 { image, mimeType }，无法处理或压不小时返回原图。 */
+async function compactImageDataUrl(dataUrl, mimeType) {
+  const original = { image: dataUrl, mimeType };
+  const match = /^data:([^;,]+);base64,(.*)$/s.exec(dataUrl);
+  if (!match || match[2].length > IMAGE_MAX_DECODE_BASE64) return original;
+  const jimp = await loadJimp();
+  if (!jimp) return original;
+  try {
+    const source = Buffer.from(match[2], 'base64');
+    const image = await jimp.Jimp.fromBuffer(source);
+    const { width, height, data } = image.bitmap;
+    if (!width || !height) return original;
+    if (width > IMAGE_MAX_EDGE || height > IMAGE_MAX_EDGE) {
+      const scale = IMAGE_MAX_EDGE / Math.max(width, height);
+      image.resize({ w: Math.round(width * scale), h: Math.round(height * scale) });
+    }
+    let hasAlpha = false;
+    if (match[1].includes('png')) {
+      for (let i = 3; i < data.length; i += 4) if (data[i] < 255) { hasAlpha = true; break; }
+    }
+    let encoded;
+    let outType = 'image/jpeg';
+    if (hasAlpha) {
+      encoded = await image.getBuffer(jimp.JimpMime.png);
+      outType = 'image/png';
+    } else {
+      for (const quality of [IMAGE_JPEG_QUALITY, ...IMAGE_FALLBACK_QUALITIES]) {
+        encoded = await image.getBuffer(jimp.JimpMime.jpeg, { quality });
+        if (encoded.length * 4 / 3 <= IMAGE_MAX_BASE64) break;
+      }
+    }
+    // 客户端已经压过的图再编码一次只会变大变糊，保留原图
+    if (encoded.length >= source.length) return original;
+    return { image: `data:${outType};base64,${encoded.toString('base64')}`, mimeType: outType };
+  } catch (e) {
+    log('warn', 'Image compaction failed, forwarding original', { error: e.message });
+    return original;
+  }
+}
+
+/** 带图请求的上游兼容处理：按厂商压缩图片，并把模型改到配置的 fast 部署。原地修改 ccBody。 */
+async function prepareImagesForUpstream(ccBody) {
+  const params = ccBody?.params;
+  if (!params || !Array.isArray(params.messages)) return;
+  const parts = [];
+  for (const msg of params.messages) {
+    if (!Array.isArray(msg.content)) continue;
+    for (const part of msg.content) {
+      if (part && part.type === 'image' && typeof part.image === 'string') parts.push(part);
+    }
+  }
+  if (!parts.length) return;
+  const requestedModel = params.model;
+  const startedAt = Date.now();
+  let bytesBefore = 0, bytesAfter = 0, cacheHits = 0, compacted = 0;
+  if (IMAGE_COMPACT_VENDORS.has(modelVendor(requestedModel))) {
+    for (const part of parts) {
+      bytesBefore += part.image.length;
+      const key = crypto.createHash('sha256').update(part.image).digest('hex');
+      let result = imageCache.get(key);
+      if (result) cacheHits++;
+      else {
+        result = await compactImageDataUrl(part.image, part.mimeType);
+        rememberImage(key, result);
+      }
+      if (result.image !== part.image) {
+        compacted++;
+        part.image = result.image;
+        if (result.mimeType) part.mimeType = result.mimeType;
+      }
+      bytesAfter += part.image.length;
+    }
+  }
+  const routedModel = IMAGE_MODEL_ROUTES.get(requestedModel);
+  if (routedModel) params.model = routedModel;
+  if (routedModel || compacted) {
+    log('info', 'Image request prepared', {
+      model: requestedModel, routedTo: routedModel || null, images: parts.length, compacted, cacheHits,
+      base64Before: bytesBefore, base64After: bytesAfter, ms: Date.now() - startedAt,
+    });
+  }
+}
+
 async function forwardToCC(body, apiKey, incomingHeaders = {}, signal, promptCacheKey) {
   const url = `${CFG.apiBase}/alpha/generate`;
   const traceparent = generateTraceparent();
@@ -1692,6 +1827,7 @@ async function handleChatCompletions(req, res) {
 
   // 构建 CC 请求体
   const ccBody = buildCcRequest(openaiReq);
+  await prepareImagesForUpstream(ccBody);
 
   // AbortController 用于客户端断连时真正打断 CC 上游（pi-commandcode-provider 模式）
   // 每次尝试都换一个新的（已 abort 的 signal 不可复用）
@@ -2725,6 +2861,7 @@ async function handleMessages(req, res) {
   // Convert Anthropic → OpenAI → CC
   const openaiReq = convertAnthropicToOpenAI(anthropicReq);
   const ccBody = buildCcRequest(openaiReq);
+  await prepareImagesForUpstream(ccBody);
 
   const abortController = new AbortController();
   let aborted = false;
@@ -3805,6 +3942,7 @@ async function handleResponses(req, res) {
   // 刷新模型目录（5 分钟节流），用于把大小写/写法归一成 CC 的精确模型 ID
   await ensureModelCatalog(apiKey);
   const ccBody = buildCcRequest(chatReq);
+  await prepareImagesForUpstream(ccBody);
   const promptCacheKey = chatReq.prompt_cache_key;
   chatReq = null;
 

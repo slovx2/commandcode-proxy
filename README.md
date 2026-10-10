@@ -88,6 +88,8 @@ commandcode/
 | `CC_EMPTY_SYSTEM_PLACEHOLDER` | `true` | Space placeholder for a missing system prompt (`.` for Claude models — Anthropic rejects whitespace-only system text); `false` disables → `emptySystemPlaceholder` |
 | `CC_MAX_BODY_MB` | `100` | Max request body size in MB; oversized requests get `413` |
 | `CC_MAX_TOOL_IMAGE_MB` | `6` | Total per-request budget for tool screenshots (base64); older ones become a placeholder; `0` disables. See [Tool screenshot budget](#tool-screenshot-budget) |
+| `CC_IMAGE_COMPACT_VENDORS` | `deepseek` | Compress request images for models of these vendors (same as the official CLI: long edge 1200, JPEG q95, PNG kept when it has alpha); comma-separated, empty disables |
+| `CC_IMAGE_MODEL_ROUTES` | `deepseek/deepseek-v4.1-flash=deepseek/deepseek-v4.1-flash-fast` | When a request carries images, send it to another deployment (`from=to`, comma-separated); empty disables. The two deployments do not share prompt cache, so a session switches once, when its first image enters |
 | `CC_STREAM_IDLE_MS` | `30000` | Streaming upstream read idle timeout; see [Upstream idle timeouts](#upstream-idle-timeouts) |
 | `CC_NONSTREAM_IDLE_MS` | `90000` | Non-streaming upstream read idle timeout |
 | `CC_UPSTREAM_RETRY_MAX` | `2` | Retries for upstream disconnects **before any byte is written downstream**; `0` disables; see [Upstream transient retry](#upstream-transient-retry) |

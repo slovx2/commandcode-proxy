@@ -88,6 +88,8 @@ commandcode/
 | `CC_EMPTY_SYSTEM_PLACEHOLDER` | `true` | 无 system prompt 时发空格占位（Claude 模型发 `.`：Anthropic 拒收纯空白 system）；`false` 关掉 → `emptySystemPlaceholder` |
 | `CC_MAX_BODY_MB` | `100` | 请求体上限（MB），超限返回 `413` |
 | `CC_MAX_TOOL_IMAGE_MB` | `6` | 单请求内工具截图（base64）总预算，超预算的老图换成占位；`0` 关闭，见[工具截图预算](#工具截图预算) |
+| `CC_IMAGE_COMPACT_VENDORS` | `deepseek` | 对这些厂商的模型压缩请求里的图片（对齐官方 CLI：长边 1200、JPEG q95，带透明通道的 PNG 保持 PNG）；逗号分隔，置空关闭 |
+| `CC_IMAGE_MODEL_ROUTES` | `deepseek/deepseek-v4.1-flash=deepseek/deepseek-v4.1-flash-fast` | 请求带图片时把模型改到另一个部署（`原模型=目标模型`，逗号分隔）；置空关闭。两个部署的提示缓存不共用，会话在第一张图进入时切换一次 |
 | `CC_STREAM_IDLE_MS` | `30000` | 流式上游读空闲超时，见[上游空闲超时](#上游空闲超时) |
 | `CC_NONSTREAM_IDLE_MS` | `90000` | 非流式上游读空闲超时（同上）|
 | `CC_UPSTREAM_RETRY_MAX` | `2` | 上游「未吐字前闪断」的内部重试次数；`0` = 关闭，见[上游闪断重试](#上游闪断重试) |
